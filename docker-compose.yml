@@ -1,0 +1,34 @@
+services:
+  dreeve-social:
+    build: ./dreeve-social
+    container_name: dreeve-social
+    restart: unless-stopped
+    mem_limit: 128m
+    volumes:
+      - ./social-data:/data
+    environment:
+      - TZ=America/Chicago
+      - DB_PATH=/data/sidecar.db
+      - ATHLETE_NAME=YourName
+      - DREEVE_URL=http://dreeve:8080
+      - DREEVE_API_TOKEN=drv_replace_with_your_64_hex_char_token
+      - PUBLIC_BASE_URL=https://social.yourdomain.com
+      - HMAC_SECRET=replace_with_a_long_random_secret_string
+      - POLL_INTERVAL_MINUTES=5
+      # Weekly digest schedule: 0 = Sunday, 18 = 6:00 PM local time
+      - DIGEST_WEEKDAY=0
+      - DIGEST_HOUR=18
+      # Prevent spamming friends with all your historical workouts on first boot
+      - SEED_EXISTING_WITHOUT_EMAIL=true
+      # Mailgun credentials
+      - MAILGUN_DOMAIN=mg.yourdomain.com
+      - MAILGUN_API_KEY=key-your-mailgun-private-api-key
+      - MAILGUN_FROM=YourName Workouts <workouts@mg.yourdomain.com>
+      - MAILGUN_API_BASE=https://api.mailgun.net # Use https://api.eu.mailgun.net for EU domains
+      # ntfy push notification topic for instant Kudos alerts
+      - NTFY_TOPIC_URL=https://ntfy.sh/your_secret_kudos_topic
+      # Seed friends (slug:DisplayName:email:initial_pref)
+      # Once seeded, friends can change their own pref via the email link without being overwritten on restart
+      - FRIENDS=alice:Alice:alice@example.com:instant,bob:Bob:bob@example.com:weekly
+    ports:
+      - "127.0.0.1:8090:8080"
