@@ -1,6 +1,6 @@
 services:
   dreeve-social:
-    build: ./dreeve-social
+    image: ghcr.io/mawise/dreeve-social:latest
     container_name: dreeve-social
     restart: unless-stopped
     mem_limit: 128m
