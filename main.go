@@ -11,6 +11,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"html/template"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"log"
 	"math"
@@ -22,6 +26,15 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+)
+
+const (
+	mapWidth       = 640
+	mapHeight      = 400
+	mapPadding     = 44
+	tileSize       = 256
+	tileCacheTTL   = 30 * 24 * time.Hour
+	maxTrackPoints = 600
 )
 
 // Config holds all environment-driven settings.
@@ -44,6 +57,7 @@ type Config struct {
 	NtfyToken       string
 	InitialFriends  string
 	SeedExisting    bool
+	OSMTileTemplate string
 }
 
 type App struct {
@@ -54,13 +68,14 @@ type App struct {
 
 // DreeveActivity matches GET /api/v1/activities items from docs.dreeve.app/api/
 type DreeveActivity struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	SportType      string `json:"sportType"`
-	WorldType      string `json:"worldType"`
-	StartDateLocal string `json:"startDateLocal"`
-	HasGPX         bool   `json:"hasGpx"`
-	Location       struct {
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	SportType       string  `json:"sportType"`
+	WorldType       string  `json:"worldType"`
+	StartDateLocal  string  `json:"startDateLocal"`
+	HasGPX          bool    `json:"hasGpx"`
+	EncodedPolyline *string `json:"encodedPolyline"`
+	Location        struct {
 		CountryCode *string `json:"countryCode"`
 		State       *string `json:"state"`
 		City        *string `json:"city"`
@@ -69,24 +84,25 @@ type DreeveActivity struct {
 		ID  string `json:"id"`
 		URL string `json:"url"`
 	} `json:"images"`
-	// Optional numeric fields if returned by Dreeve or computed from GPX
 	DistanceMeters     float64 `json:"distance"`
 	MovingTimeSeconds  int     `json:"movingTime"`
 	ElevationGainMeter float64 `json:"elevationGain"`
 }
 
 type StoredActivity struct {
-	ID             string
-	Name           string
-	SportType      string
-	StartDateLocal string
-	LocationStr    string
-	DistanceM      float64
-	MovingTimeS    int
-	ElevationM     float64
-	ImageURL       string
-	DigestSent     bool
-	CreatedAt      time.Time
+	ID              string
+	Name            string
+	SportType       string
+	StartDateLocal  string
+	LocationStr     string
+	DistanceM       float64
+	MovingTimeS     int
+	ElevationM      float64
+	ImageURL        string // Legacy single image column
+	ImageURLs       []string
+	EncodedPolyline string
+	DigestSent      bool
+	CreatedAt       time.Time
 }
 
 type Subscriber struct {
@@ -94,6 +110,11 @@ type Subscriber struct {
 	Name  string // Display name, e.g. "Alice"
 	Email string
 	Pref  string // "instant", "weekly", or "none"
+}
+
+type LatLon struct {
+	Lat float64
+	Lon float64
 }
 
 func loadConfig() Config {
@@ -111,24 +132,25 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		DBPath:         getEnv("DB_PATH", "/data/sidecar.db"),
-		ListenAddr:     getEnv("LISTEN_ADDR", ":8080"),
-		AthleteName:    getEnv("ATHLETE_NAME", "Alex"),
-		DreeveURL:      strings.TrimRight(getEnv("DREEVE_URL", "http://dreeve:8080"), "/"),
-		DreeveToken:    getEnv("DREEVE_API_TOKEN", ""),
-		PublicBaseURL:  strings.TrimRight(getEnv("PUBLIC_BASE_URL", "http://localhost:8090"), "/"),
-		HMACSecret:     getEnv("HMAC_SECRET", "change-me-in-production"),
-		PollInterval:   time.Duration(pollMin) * time.Minute,
-		DigestWeekday:  time.Weekday(digestDayInt),
-		DigestHour:     digestHour,
-		MailgunDomain:  getEnv("MAILGUN_DOMAIN", ""),
-		MailgunAPIKey:  getEnv("MAILGUN_API_KEY", ""),
-		MailgunFrom:    getEnv("MAILGUN_FROM", "Dreeve Social <noreply@example.com>"),
-		MailgunAPIBase: strings.TrimRight(getEnv("MAILGUN_API_BASE", "https://api.mailgun.net"), "/"),
-		NtfyTopicURL:   getEnv("NTFY_TOPIC_URL", ""),
-		NtfyToken:      getEnv("NTFY_TOKEN", ""),
-		InitialFriends: getEnv("FRIENDS", ""),
-		SeedExisting:   strings.EqualFold(getEnv("SEED_EXISTING_WITHOUT_EMAIL", "true"), "true"),
+		DBPath:          getEnv("DB_PATH", "/data/sidecar.db"),
+		ListenAddr:      getEnv("LISTEN_ADDR", ":8080"),
+		AthleteName:     getEnv("ATHLETE_NAME", "Alex"),
+		DreeveURL:       strings.TrimRight(getEnv("DREEVE_URL", "http://dreeve:8080"), "/"),
+		DreeveToken:     getEnv("DREEVE_API_TOKEN", ""),
+		PublicBaseURL:   strings.TrimRight(getEnv("PUBLIC_BASE_URL", "http://localhost:8090"), "/"),
+		HMACSecret:      getEnv("HMAC_SECRET", "change-me-in-production"),
+		PollInterval:    time.Duration(pollMin) * time.Minute,
+		DigestWeekday:   time.Weekday(digestDayInt),
+		DigestHour:      digestHour,
+		MailgunDomain:   getEnv("MAILGUN_DOMAIN", ""),
+		MailgunAPIKey:   getEnv("MAILGUN_API_KEY", ""),
+		MailgunFrom:     getEnv("MAILGUN_FROM", "Dreeve Social <noreply@example.com>"),
+		MailgunAPIBase:  strings.TrimRight(getEnv("MAILGUN_API_BASE", "https://api.mailgun.net"), "/"),
+		NtfyTopicURL:    getEnv("NTFY_TOPIC_URL", ""),
+		NtfyToken:       getEnv("NTFY_TOKEN", ""),
+		InitialFriends:  getEnv("FRIENDS", ""),
+		SeedExisting:    strings.EqualFold(getEnv("SEED_EXISTING_WITHOUT_EMAIL", "true"), "true"),
+		OSMTileTemplate: getEnv("OSM_TILE_URL", "https://tile.openstreetmap.org/%d/%d/%d.png"),
 	}
 }
 
@@ -150,14 +172,14 @@ func main() {
 	app := &App{
 		cfg:        cfg,
 		db:         db,
-		httpClient: &http.Client{Timeout: 25 * time.Second},
+		httpClient: &http.Client{Timeout: 20 * time.Second},
 	}
 
 	if err := app.seedFriendsFromEnv(); err != nil {
 		log.Printf("warning seeding friends: %v", err)
 	}
 
-	// Background goroutine: Dreeve poller + Weekly Digest scheduler
+	// Background goroutine: Dreeve poller + Weekly Digest scheduler + Tile cache cleanup
 	go app.backgroundLoop()
 
 	mux := http.NewServeMux()
@@ -166,6 +188,8 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("GET /feed.xml", app.handleRSSFeed)
+	mux.HandleFunc("GET /map.png", app.handleMapPNG)
+	mux.HandleFunc("GET /photo", app.handleActivityPhoto)
 	mux.HandleFunc("GET /kudos", app.handleKudosGet)
 	mux.HandleFunc("POST /api/kudos", app.handleKudosPost)
 	mux.HandleFunc("GET /preferences", app.handlePreferencesGet)
@@ -176,7 +200,7 @@ func main() {
 }
 
 // ============================================================================
-// Database Initialization & Friend Seeding
+// Database Initialization & Migrations
 // ============================================================================
 
 func initDB(path string) (*sql.DB, error) {
@@ -203,8 +227,19 @@ func initDB(path string) (*sql.DB, error) {
 		moving_time_s INTEGER NOT NULL DEFAULT 0,
 		elevation_m REAL NOT NULL DEFAULT 0,
 		image_url TEXT NOT NULL DEFAULT '',
+		image_urls_json TEXT NOT NULL DEFAULT '[]',
+		encoded_polyline TEXT NOT NULL DEFAULT '',
 		digest_sent INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS tile_cache (
+		z INTEGER NOT NULL,
+		x INTEGER NOT NULL,
+		y INTEGER NOT NULL,
+		png_data BLOB NOT NULL,
+		fetched_at DATETIME NOT NULL,
+		PRIMARY KEY (z, x, y)
 	);
 
 	CREATE TABLE IF NOT EXISTS kudos (
@@ -220,13 +255,17 @@ func initDB(path string) (*sql.DB, error) {
 		value TEXT NOT NULL
 	);
 	`
-	_, err = db.Exec(schema)
-	return db, err
+	if _, err := db.Exec(schema); err != nil {
+		return nil, err
+	}
+
+	// Safe migrations for existing databases created before map & multi-photo support
+	_, _ = db.Exec(`ALTER TABLE activities ADD COLUMN image_urls_json TEXT NOT NULL DEFAULT '[]'`)
+	_, _ = db.Exec(`ALTER TABLE activities ADD COLUMN encoded_polyline TEXT NOT NULL DEFAULT ''`)
+
+	return db, nil
 }
 
-// seedFriendsFromEnv parses FRIENDS="alice:Alice:alice@example.com:instant,bob:Bob:bob@example.com:weekly"
-// or shorthand "alice:alice@example.com,bob:bob@example.com".
-// It inserts new subscribers and updates email/name, but NEVER overwrites a friend's chosen 'pref' if they already exist.
 func (a *App) seedFriendsFromEnv() error {
 	if a.cfg.InitialFriends == "" {
 		return nil
@@ -319,11 +358,30 @@ func (a *App) feedURL(subscriberID, mode string) string {
 	return a.cfg.PublicBaseURL + "/feed.xml?" + q.Encode()
 }
 
+func (a *App) mapURL(activityID string) string {
+	sig := a.sign("map", activityID)
+	q := url.Values{}
+	q.Set("act", activityID)
+	q.Set("sig", sig)
+	return a.cfg.PublicBaseURL + "/map.png?" + q.Encode()
+}
+
+func (a *App) photoURL(activityID string, idx int) string {
+	payload := fmt.Sprintf("%s:%d", activityID, idx)
+	sig := a.sign("photo", payload)
+	q := url.Values{}
+	q.Set("act", activityID)
+	q.Set("idx", strconv.Itoa(idx))
+	q.Set("sig", sig)
+	return a.cfg.PublicBaseURL + "/photo?" + q.Encode()
+}
+
 // ============================================================================
-// Dreeve Polling & Weekly Digest Loop
+// Dreeve Polling, GPX Track Parsing & Weekly Digest Loop
 // ============================================================================
 
 func (a *App) backgroundLoop() {
+	a.pruneExpiredTiles()
 	a.pollDreeve()
 	a.maybeSendWeeklyDigests()
 
@@ -337,6 +395,7 @@ func (a *App) backgroundLoop() {
 		case <-pollTicker.C:
 			a.pollDreeve()
 		case <-digestTicker.C:
+			a.pruneExpiredTiles()
 			a.maybeSendWeeklyDigests()
 		}
 	}
@@ -381,34 +440,37 @@ func (a *App) pollDreeve() {
 		return
 	}
 
-	// Check if this is the very first run on an empty DB so we don't spam 50 old emails
 	isFirstSync := a.isFirstSync()
 
-	// Process oldest-to-newest
 	for i := len(activities) - 1; i >= 0; i-- {
 		act := activities[i]
-		if act.ID == "" {
-			continue
-		}
-		if a.activityExists(act.ID) {
+		if act.ID == "" || a.activityExists(act.ID) {
 			continue
 		}
 
-		// Enrich distance & elevation from GPX if not in summary JSON
-		if act.DistanceMeters == 0 && act.HasGPX {
-			distM, elevM, durS := a.computeStatsFromGPX(act.ID)
-			if distM > 0 {
+		poly := ""
+		if act.EncodedPolyline != nil {
+			poly = strings.TrimSpace(*act.EncodedPolyline)
+		}
+
+		// Fetch GPX if we need stats OR if encodedPolyline wasn't included in the summary
+		if act.HasGPX && (act.DistanceMeters == 0 || poly == "") {
+			distM, elevM, durS, gpxPoly := a.computeStatsAndPolylineFromGPX(act.ID)
+			if distM > 0 && act.DistanceMeters == 0 {
 				act.DistanceMeters = distM
 			}
-			if elevM > 0 {
+			if elevM > 0 && act.ElevationGainMeter == 0 {
 				act.ElevationGainMeter = elevM
 			}
 			if durS > 0 && act.MovingTimeSeconds == 0 {
 				act.MovingTimeSeconds = durS
 			}
+			if poly == "" && gpxPoly != "" {
+				poly = gpxPoly
+			}
 		}
 
-		stored := toStoredActivity(act)
+		stored := toStoredActivity(act, poly)
 		if isFirstSync && a.cfg.SeedExisting {
 			stored.DigestSent = true
 		}
@@ -423,6 +485,11 @@ func (a *App) pollDreeve() {
 			continue
 		}
 
+		// Pre-warm OSM tile cache for the new workout before sending emails
+		if stored.EncodedPolyline != "" {
+			_, _ = a.renderMapForPolyline(stored.EncodedPolyline)
+		}
+
 		log.Printf("new activity detected: %s (%s)", stored.Name, stored.ID)
 		a.sendInstantEmails(stored)
 	}
@@ -433,7 +500,6 @@ func (a *App) pollDreeve() {
 }
 
 func parseDreeveActivities(raw []byte) ([]DreeveActivity, error) {
-	// Support both direct JSON array [...] and wrapped object {"items": [...]} or {"data": [...]}
 	var list []DreeveActivity
 	if err := json.Unmarshal(raw, &list); err == nil {
 		return list, nil
@@ -455,11 +521,10 @@ func parseDreeveActivities(raw []byte) ([]DreeveActivity, error) {
 	return wrapped.Activities, nil
 }
 
-// computeStatsFromGPX fetches GET /api/v1/activities/{id}/gpx and computes Haversine distance & elevation gain.
-func (a *App) computeStatsFromGPX(activityID string) (distMeters float64, elevGain float64, durationSec int) {
+func (a *App) computeStatsAndPolylineFromGPX(activityID string) (distMeters float64, elevGain float64, durationSec int, encodedPoly string) {
 	req, err := http.NewRequest("GET", a.cfg.DreeveURL+"/api/v1/activities/"+url.PathEscape(activityID)+"/gpx", nil)
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, ""
 	}
 	req.Header.Set("Authorization", "Bearer "+a.cfg.DreeveToken)
 	resp, err := a.httpClient.Do(req)
@@ -467,7 +532,7 @@ func (a *App) computeStatsFromGPX(activityID string) (distMeters float64, elevGa
 		if resp != nil {
 			resp.Body.Close()
 		}
-		return 0, 0, 0
+		return 0, 0, 0, ""
 	}
 	defer resp.Body.Close()
 
@@ -484,16 +549,18 @@ func (a *App) computeStatsFromGPX(activityID string) (distMeters float64, elevGa
 		} `xml:"trk"`
 	}
 	if err := xml.NewDecoder(resp.Body).Decode(&gpx); err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, ""
 	}
 
 	var prevLat, prevLon, prevEle float64
 	var havePrev bool
 	var firstTime, lastTime time.Time
+	var pts []LatLon
 
 	for _, trk := range gpx.Trk {
 		for _, seg := range trk.TrkSeg {
 			for _, pt := range seg.TrkPt {
+				pts = append(pts, LatLon{Lat: pt.Lat, Lon: pt.Lon})
 				if pt.Time != "" {
 					if t, err := time.Parse(time.RFC3339, pt.Time); err == nil {
 						if firstTime.IsZero() {
@@ -516,7 +583,10 @@ func (a *App) computeStatsFromGPX(activityID string) (distMeters float64, elevGa
 	if !firstTime.IsZero() && !lastTime.IsZero() && lastTime.After(firstTime) {
 		durationSec = int(lastTime.Sub(firstTime).Seconds())
 	}
-	return distMeters, elevGain, durationSec
+	if len(pts) > 1 {
+		encodedPoly = encodePolyline(downsamplePoints(pts, maxTrackPoints))
+	}
+	return distMeters, elevGain, durationSec, encodedPoly
 }
 
 func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
@@ -529,7 +599,7 @@ func haversineMeters(lat1, lon1, lat2, lon2 float64) float64 {
 	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
-func toStoredActivity(act DreeveActivity) StoredActivity {
+func toStoredActivity(act DreeveActivity, poly string) StoredActivity {
 	var locParts []string
 	if act.Location.City != nil && *act.Location.City != "" {
 		locParts = append(locParts, *act.Location.City)
@@ -540,21 +610,29 @@ func toStoredActivity(act DreeveActivity) StoredActivity {
 	if act.Location.CountryCode != nil && *act.Location.CountryCode != "" {
 		locParts = append(locParts, strings.ToUpper(*act.Location.CountryCode))
 	}
-	imgURL := ""
-	if len(act.Images) > 0 {
-		imgURL = act.Images[0].URL
+	var imgURLs []string
+	for _, im := range act.Images {
+		if strings.TrimSpace(im.URL) != "" {
+			imgURLs = append(imgURLs, strings.TrimSpace(im.URL))
+		}
+	}
+	firstImg := ""
+	if len(imgURLs) > 0 {
+		firstImg = imgURLs[0]
 	}
 	return StoredActivity{
-		ID:             act.ID,
-		Name:           act.Name,
-		SportType:      act.SportType,
-		StartDateLocal: act.StartDateLocal,
-		LocationStr:    strings.Join(locParts, ", "),
-		DistanceM:      act.DistanceMeters,
-		MovingTimeS:    act.MovingTimeSeconds,
-		ElevationM:     act.ElevationGainMeter,
-		ImageURL:       imgURL,
-		CreatedAt:      time.Now().UTC(),
+		ID:              act.ID,
+		Name:            act.Name,
+		SportType:       act.SportType,
+		StartDateLocal:  act.StartDateLocal,
+		LocationStr:     strings.Join(locParts, ", "),
+		DistanceM:       act.DistanceMeters,
+		MovingTimeS:     act.MovingTimeSeconds,
+		ElevationM:      act.ElevationGainMeter,
+		ImageURL:        firstImg,
+		ImageURLs:       imgURLs,
+		EncodedPolyline: poly,
+		CreatedAt:       time.Now().UTC(),
 	}
 }
 
@@ -575,14 +653,418 @@ func (a *App) saveActivity(act StoredActivity) error {
 	if act.DigestSent {
 		digestInt = 1
 	}
+	imgsJSON, _ := json.Marshal(act.ImageURLs)
 	_, err := a.db.Exec(`
 		INSERT INTO activities (
 			id, name, sport_type, start_date_local, location_str,
-			distance_m, moving_time_s, elevation_m, image_url, digest_sent, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			distance_m, moving_time_s, elevation_m, image_url, image_urls_json,
+			encoded_polyline, digest_sent, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, act.ID, act.Name, act.SportType, act.StartDateLocal, act.LocationStr,
-		act.DistanceM, act.MovingTimeS, act.ElevationM, act.ImageURL, digestInt, act.CreatedAt)
+		act.DistanceM, act.MovingTimeS, act.ElevationM, act.ImageURL, string(imgsJSON),
+		act.EncodedPolyline, digestInt, act.CreatedAt)
 	return err
+}
+
+// ============================================================================
+// OSM Tile Caching (30 Days), Map Rendering & Photo Proxy
+// ============================================================================
+
+func (a *App) pruneExpiredTiles() {
+	cutoff := time.Now().UTC().Add(-tileCacheTTL)
+	_, _ = a.db.Exec(`DELETE FROM tile_cache WHERE fetched_at < ?`, cutoff)
+}
+
+func (a *App) getOSMTile(z, x, y int) (image.Image, error) {
+	var pngBytes []byte
+	var fetchedAt time.Time
+	err := a.db.QueryRow(`SELECT png_data, fetched_at FROM tile_cache WHERE z = ? AND x = ? AND y = ?`, z, x, y).
+		Scan(&pngBytes, &fetchedAt)
+	if err == nil && time.Since(fetchedAt) < tileCacheTTL {
+		if img, decErr := png.Decode(bytes.NewReader(pngBytes)); decErr == nil {
+			return img, nil
+		}
+	}
+
+	n := 1 << z
+	wrapX := ((x % n) + n) % n
+	tileURL := fmt.Sprintf(a.cfg.OSMTileTemplate, z, wrapX, y)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", tileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", fmt.Sprintf("dreeve-social/1.0 (+%s)", a.cfg.PublicBaseURL))
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OSM tile HTTP %d", resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return nil, err
+	}
+
+	img, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+
+	_, _ = a.db.Exec(`
+		INSERT INTO tile_cache (z, x, y, png_data, fetched_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(z, x, y) DO UPDATE SET
+			png_data = excluded.png_data,
+			fetched_at = excluded.fetched_at
+	`, z, wrapX, y, raw, time.Now().UTC())
+
+	return img, nil
+}
+
+// renderMapForPolyline draws the GPS track onto cached OSM tiles, falling back cleanly
+// to a solid white background if any OSM tile fails to load.
+func (a *App) renderMapForPolyline(encoded string) ([]byte, error) {
+	pts := decodePolyline(encoded)
+	if len(pts) < 2 {
+		return nil, fmt.Errorf("not enough track points")
+	}
+
+	minLat, maxLat := pts[0].Lat, pts[0].Lat
+	minLon, maxLon := pts[0].Lon, pts[0].Lon
+	for _, p := range pts[1:] {
+		if p.Lat < minLat {
+			minLat = p.Lat
+		}
+		if p.Lat > maxLat {
+			maxLat = p.Lat
+		}
+		if p.Lon < minLon {
+			minLon = p.Lon
+		}
+		if p.Lon > maxLon {
+			maxLon = p.Lon
+		}
+	}
+
+	// Pick highest zoom (16 down to 1) that fits the track within the padded canvas
+	zoom := 14
+	for z := 16; z >= 1; z-- {
+		x1, y1 := lonLatToWorldPx(minLon, maxLat, z)
+		x2, y2 := lonLatToWorldPx(maxLon, minLat, z)
+		if math.Abs(x2-x1) <= float64(mapWidth-2*mapPadding) &&
+			math.Abs(y2-y1) <= float64(mapHeight-2*mapPadding) {
+			zoom = z
+			break
+		}
+	}
+
+	xMinPx, yMinPx := lonLatToWorldPx(minLon, maxLat, zoom)
+	xMaxPx, yMaxPx := lonLatToWorldPx(maxLon, minLat, zoom)
+	centerX := (xMinPx + xMaxPx) / 2.0
+	centerY := (yMinPx + yMaxPx) / 2.0
+	originX := centerX - float64(mapWidth)/2.0
+	originY := centerY - float64(mapHeight)/2.0
+
+	// 1. Start with a solid white canvas (serves as the fallback if tiles fail)
+	canvas := image.NewRGBA(image.Rect(0, 0, mapWidth, mapHeight))
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: color.RGBA{255, 255, 255, 255}}, image.Point{}, draw.Src)
+
+	// 2. Fetch all required OSM tiles; only composite if all tiles succeed
+	minTileX := int(math.Floor(originX / tileSize))
+	maxTileX := int(math.Floor((originX + float64(mapWidth) - 1) / tileSize))
+	minTileY := int(math.Floor(originY / tileSize))
+	maxTileY := int(math.Floor((originY + float64(mapHeight) - 1) / tileSize))
+	maxValidTileY := (1 << zoom) - 1
+
+	type placedTile struct {
+		img        image.Image
+		dstX, dstY int
+	}
+	var tiles []placedTile
+	tilesOK := true
+
+	for tx := minTileX; tx <= maxTileX && tilesOK; tx++ {
+		for ty := minTileY; ty <= maxTileY; ty++ {
+			if ty < 0 || ty > maxValidTileY {
+				continue
+			}
+			tImg, err := a.getOSMTile(zoom, tx, ty)
+			if err != nil {
+				log.Printf("OSM tile (%d/%d/%d) error (%v); falling back to white background", zoom, tx, ty, err)
+				tilesOK = false
+				break
+			}
+			tiles = append(tiles, placedTile{
+				img:  tImg,
+				dstX: tx*tileSize - int(math.Round(originX)),
+				dstY: ty*tileSize - int(math.Round(originY)),
+			})
+		}
+	}
+
+	if tilesOK {
+		for _, pt := range tiles {
+			r := image.Rect(pt.dstX, pt.dstY, pt.dstX+tileSize, pt.dstY+tileSize)
+			draw.Draw(canvas, r, pt.img, image.Point{}, draw.Over)
+		}
+	}
+
+	// 3. Convert GPS coordinates to canvas pixels
+	type pxPt struct{ x, y float64 }
+	pxPts := make([]pxPt, len(pts))
+	for i, p := range pts {
+		wx, wy := lonLatToWorldPx(p.Lon, p.Lat, zoom)
+		pxPts[i] = pxPt{x: wx - originX, y: wy - originY}
+	}
+
+	// 4. Draw white casing halo first, then orange GPS track (#ea580c)
+	whiteHalo := color.RGBA{255, 255, 255, 235}
+	routeOrange := color.RGBA{234, 88, 12, 255}
+	for i := 1; i < len(pxPts); i++ {
+		drawThickSegment(canvas, pxPts[i-1].x, pxPts[i-1].y, pxPts[i].x, pxPts[i].y, 4.0, whiteHalo)
+	}
+	for i := 1; i < len(pxPts); i++ {
+		drawThickSegment(canvas, pxPts[i-1].x, pxPts[i-1].y, pxPts[i].x, pxPts[i].y, 2.5, routeOrange)
+	}
+
+	// 5. Draw Start (green) and End (red) markers
+	startPt := pxPts[0]
+	endPt := pxPts[len(pxPts)-1]
+	drawFilledCircle(canvas, startPt.x, startPt.y, 6.5, color.RGBA{255, 255, 255, 255})
+	drawFilledCircle(canvas, startPt.x, startPt.y, 4.5, color.RGBA{22, 163, 74, 255})
+	drawFilledCircle(canvas, endPt.x, endPt.y, 6.5, color.RGBA{255, 255, 255, 255})
+	drawFilledCircle(canvas, endPt.x, endPt.y, 4.5, color.RGBA{220, 38, 38, 255})
+
+	var out bytes.Buffer
+	if err := png.Encode(&out, canvas); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func drawThickSegment(img *image.RGBA, x0, y0, x1, y1, radius float64, c color.RGBA) {
+	dx := x1 - x0
+	dy := y1 - y0
+	dist := math.Hypot(dx, dy)
+	steps := int(math.Ceil(dist * 2.0))
+	if steps < 1 {
+		steps = 1
+	}
+	for s := 0; s <= steps; s++ {
+		t := float64(s) / float64(steps)
+		drawFilledCircle(img, x0+dx*t, y0+dy*t, radius, c)
+	}
+}
+
+func drawFilledCircle(img *image.RGBA, cx, cy, radius float64, c color.RGBA) {
+	minX := int(math.Floor(cx - radius - 1))
+	maxX := int(math.Ceil(cx + radius + 1))
+	minY := int(math.Floor(cy - radius - 1))
+	maxY := int(math.Ceil(cy + radius + 1))
+	bounds := img.Bounds()
+	rSq := radius * radius
+
+	for y := minY; y <= maxY; y++ {
+		if y < bounds.Min.Y || y >= bounds.Max.Y {
+			continue
+		}
+		for x := minX; x <= maxX; x++ {
+			if x < bounds.Min.X || x >= bounds.Max.X {
+				continue
+			}
+			dx := float64(x) + 0.5 - cx
+			dy := float64(y) + 0.5 - cy
+			if dx*dx+dy*dy <= rSq {
+				img.SetRGBA(x, y, c)
+			}
+		}
+	}
+}
+
+func lonLatToWorldPx(lon, lat float64, zoom int) (float64, float64) {
+	if lat > 85.0511 {
+		lat = 85.0511
+	} else if lat < -85.0511 {
+		lat = -85.0511
+	}
+	scale := float64(int(tileSize) << zoom)
+	x := (lon + 180.0) / 360.0 * scale
+	latRad := lat * math.Pi / 180.0
+	y := (1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * scale
+	return x, y
+}
+
+func downsamplePoints(pts []LatLon, maxPts int) []LatLon {
+	if len(pts) <= maxPts || maxPts < 2 {
+		return pts
+	}
+	out := make([]LatLon, 0, maxPts)
+	step := float64(len(pts)-1) / float64(maxPts-1)
+	for i := 0; i < maxPts-1; i++ {
+		out = append(out, pts[int(math.Round(float64(i)*step))])
+	}
+	out = append(out, pts[len(pts)-1])
+	return out
+}
+
+func encodePolyline(pts []LatLon) string {
+	var buf strings.Builder
+	var prevLat, prevLon int
+	for _, p := range pts {
+		lat := int(math.Round(p.Lat * 1e5))
+		lon := int(math.Round(p.Lon * 1e5))
+		encodeSignedNumber(&buf, lat-prevLat)
+		encodeSignedNumber(&buf, lon-prevLon)
+		prevLat, prevLon = lat, lon
+	}
+	return buf.String()
+}
+
+func encodeSignedNumber(buf *strings.Builder, num int) {
+	v := num << 1
+	if num < 0 {
+		v = ^v
+	}
+	for v >= 0x20 {
+		buf.WriteByte(byte((0x20 | (v & 0x1f)) + 63))
+		v >>= 5
+	}
+	buf.WriteByte(byte(v + 63))
+}
+
+func decodePolyline(encoded string) []LatLon {
+	var pts []LatLon
+	var index, lat, lon int
+	for index < len(encoded) {
+		var result, shift int
+		for {
+			if index >= len(encoded) {
+				return pts
+			}
+			b := int(encoded[index]) - 63
+			index++
+			result |= (b & 0x1f) << shift
+			shift += 5
+			if b < 0x20 {
+				break
+			}
+		}
+		if (result & 1) != 0 {
+			lat += ^(result >> 1)
+		} else {
+			lat += result >> 1
+		}
+
+		result, shift = 0, 0
+		for {
+			if index >= len(encoded) {
+				return pts
+			}
+			b := int(encoded[index]) - 63
+			index++
+			result |= (b & 0x1f) << shift
+			shift += 5
+			if b < 0x20 {
+				break
+			}
+		}
+		if (result & 1) != 0 {
+			lon += ^(result >> 1)
+		} else {
+			lon += result >> 1
+		}
+
+		pts = append(pts, LatLon{Lat: float64(lat) / 1e5, Lon: float64(lon) / 1e5})
+	}
+	return pts
+}
+
+// handleMapPNG serves the rendered GPS route map PNG for an activity.
+func (a *App) handleMapPNG(w http.ResponseWriter, r *http.Request) {
+	actID := r.URL.Query().Get("act")
+	sig := r.URL.Query().Get("sig")
+	if actID == "" || !a.verify("map", actID, sig) {
+		http.Error(w, "Invalid map signature", http.StatusForbidden)
+		return
+	}
+
+	act, err := a.getActivity(actID)
+	if err != nil || act.EncodedPolyline == "" {
+		http.Error(w, "Map not found for activity", http.StatusNotFound)
+		return
+	}
+
+	pngBytes, err := a.renderMapForPolyline(act.EncodedPolyline)
+	if err != nil {
+		http.Error(w, "Failed to render map", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(pngBytes)
+}
+
+// handleActivityPhoto proxies Dreeve user photos so friends can view them in Email/RSS
+// even when Dreeve is hosted on a private internal Docker network.
+func (a *App) handleActivityPhoto(w http.ResponseWriter, r *http.Request) {
+	actID := r.URL.Query().Get("act")
+	idxStr := r.URL.Query().Get("idx")
+	sig := r.URL.Query().Get("sig")
+
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil || idx < 0 || actID == "" || !a.verify("photo", fmt.Sprintf("%s:%d", actID, idx), sig) {
+		http.Error(w, "Invalid photo signature", http.StatusForbidden)
+		return
+	}
+
+	act, err := a.getActivity(actID)
+	if err != nil || idx >= len(act.ImageURLs) {
+		http.Error(w, "Photo not found", http.StatusNotFound)
+		return
+	}
+
+	rawURL := act.ImageURLs[idx]
+	targetURL := rawURL
+	if strings.HasPrefix(rawURL, "/") {
+		targetURL = a.cfg.DreeveURL + rawURL
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), "GET", targetURL, nil)
+	if err != nil {
+		http.Error(w, "Bad photo URL", http.StatusBadGateway)
+		return
+	}
+	if strings.HasPrefix(targetURL, a.cfg.DreeveURL) && a.cfg.DreeveToken != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.DreeveToken)
+	}
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		http.Error(w, "Upstream photo unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	} else {
+		w.Header().Set("Content-Type", "image/jpeg")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=604800")
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, 15*1024*1024))
 }
 
 // ============================================================================
@@ -616,7 +1098,6 @@ func (a *App) maybeSendWeeklyDigests() {
 		return
 	}
 
-	// Ensure we only send one weekly digest per ISO week
 	isoYear, isoWeek := now.ISOWeek()
 	weekKey := fmt.Sprintf("%d-W%02d", isoYear, isoWeek)
 	var lastSentWeek string
@@ -650,7 +1131,6 @@ func (a *App) maybeSendWeeklyDigests() {
 		}
 	}
 
-	// Mark activities as included in weekly digest and record weekKey
 	_, _ = a.db.Exec(`UPDATE activities SET digest_sent = 1 WHERE digest_sent = 0`)
 	_, _ = a.db.Exec(`INSERT OR REPLACE INTO meta (key, value) VALUES ('last_digest_week', ?)`, weekKey)
 }
@@ -693,6 +1173,8 @@ type emailActivityCard struct {
 	StoredActivity
 	FormattedDate string
 	StatsLine     string
+	MapImageURL   string
+	PhotoURLs     []string
 	KudosURL      string
 }
 
@@ -710,18 +1192,34 @@ func (a *App) renderActivityEmail(sub Subscriber, acts []StoredActivity, isWeekl
 		kURL := a.kudosURL(act.ID, sub.ID)
 		stats := formatStatsLine(act)
 		fDate := formatPrettyDate(act.StartDateLocal)
+
+		mapImg := ""
+		if act.EncodedPolyline != "" {
+			mapImg = a.mapURL(act.ID)
+		}
+		var photos []string
+		for idx := range act.ImageURLs {
+			photos = append(photos, a.photoURL(act.ID, idx))
+		}
+
 		cards = append(cards, emailActivityCard{
 			StoredActivity: act,
 			FormattedDate:  fDate,
 			StatsLine:      stats,
+			MapImageURL:    mapImg,
+			PhotoURLs:      photos,
 			KudosURL:       kURL,
 		})
+
 		fmt.Fprintf(&textBuilder, "- %s (%s) on %s\n", act.Name, act.SportType, fDate)
 		if stats != "" {
 			fmt.Fprintf(&textBuilder, "  Stats: %s\n", stats)
 		}
 		if act.LocationStr != "" {
 			fmt.Fprintf(&textBuilder, "  Location: %s\n", act.LocationStr)
+		}
+		if mapImg != "" {
+			fmt.Fprintf(&textBuilder, "  Route Map: %s\n", mapImg)
 		}
 		fmt.Fprintf(&textBuilder, "  Give Kudos (1-click): %s\n\n", kURL)
 	}
@@ -827,7 +1325,8 @@ func (a *App) renderPreferencesPage(w http.ResponseWriter, sub Subscriber, sig s
 	_ = prefPageTmpl.Execute(w, data)
 }
 
-// handleRSSFeed serves user-specific RSS feeds in either 'instant' (per-activity) or 'weekly' (digest) mode.
+// handleRSSFeed serves user-specific RSS feeds in either 'instant' (per-activity) or 'weekly' (digest) mode,
+// including route map PNGs and all Dreeve user photos.
 func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 	who := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("who")))
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
@@ -877,21 +1376,29 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 		for _, act := range acts {
 			actTime := parseActivityTime(act.StartDateLocal, act.CreatedAt)
 			kURL := a.kudosURL(act.ID, sub.ID)
-			desc := fmt.Sprintf("<p><strong>%s</strong> (%s) — %s</p>",
+			var desc strings.Builder
+
+			fmt.Fprintf(&desc, "<p><strong>%s</strong> (%s) — %s</p>",
 				template.HTMLEscapeString(act.Name),
 				template.HTMLEscapeString(act.SportType),
 				template.HTMLEscapeString(formatPrettyDate(act.StartDateLocal)))
 			if stats := formatStatsLine(act); stats != "" {
-				desc += fmt.Sprintf("<p>📊 %s</p>", template.HTMLEscapeString(stats))
+				fmt.Fprintf(&desc, "<p>📊 %s</p>", template.HTMLEscapeString(stats))
 			}
 			if act.LocationStr != "" {
-				desc += fmt.Sprintf("<p>📍 %s</p>", template.HTMLEscapeString(act.LocationStr))
+				fmt.Fprintf(&desc, "<p>📍 %s</p>", template.HTMLEscapeString(act.LocationStr))
 			}
-			if act.ImageURL != "" {
-				desc += fmt.Sprintf(`<p><img src="%s" alt="Workout photo" style="max-width:100%%;border-radius:8px;" /></p>`,
-					template.HTMLEscapeString(act.ImageURL))
+			if act.EncodedPolyline != "" {
+				mURL := a.mapURL(act.ID)
+				fmt.Fprintf(&desc, `<p><img src="%s" alt="GPS route map" style="max-width:100%%;border-radius:8px;border:1px solid #e5e7eb;" /></p>`,
+					template.HTMLEscapeString(mURL))
 			}
-			desc += fmt.Sprintf(`<p><a href="%s"><strong>👍 Give Kudos to %s (1-Click)</strong></a></p>`,
+			for idx := range act.ImageURLs {
+				pURL := a.photoURL(act.ID, idx)
+				fmt.Fprintf(&desc, `<p><img src="%s" alt="Workout photo" style="max-width:100%%;border-radius:8px;" /></p>`,
+					template.HTMLEscapeString(pURL))
+			}
+			fmt.Fprintf(&desc, `<p><a href="%s"><strong>👍 Give Kudos to %s (1-Click)</strong></a></p>`,
 				template.HTMLEscapeString(kURL), template.HTMLEscapeString(a.cfg.AthleteName))
 
 			items = append(items, rssItem{
@@ -899,7 +1406,7 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 				Link:        kURL,
 				GUID:        act.ID + "-" + sub.ID,
 				PubDate:     actTime.Format(time.RFC1123Z),
-				Description: desc,
+				Description: desc.String(),
 			})
 		}
 	} else {
@@ -930,21 +1437,36 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 
 		for _, g := range groups {
 			var desc strings.Builder
-			fmt.Fprintf(&desc, "<p><strong>%s's workouts for week %s (%d activities):</strong></p><ul>",
+			fmt.Fprintf(&desc, "<p><strong>%s's workouts for week %s (%d activities):</strong></p>",
 				template.HTMLEscapeString(a.cfg.AthleteName), g.Key, len(g.Acts))
 			for _, act := range g.Acts {
 				kURL := a.kudosURL(act.ID, sub.ID)
 				stats := formatStatsLine(act)
-				fmt.Fprintf(&desc, `<li><strong>%s</strong> (%s) — %s `,
+				fmt.Fprintf(&desc, `<div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #e5e7eb;">`)
+				fmt.Fprintf(&desc, `<p><strong>%s</strong> (%s) — %s`,
 					template.HTMLEscapeString(act.Name),
 					template.HTMLEscapeString(act.SportType),
 					template.HTMLEscapeString(formatPrettyDate(act.StartDateLocal)))
 				if stats != "" {
-					fmt.Fprintf(&desc, `[%s] `, template.HTMLEscapeString(stats))
+					fmt.Fprintf(&desc, `<br/>📊 %s`, template.HTMLEscapeString(stats))
 				}
-				fmt.Fprintf(&desc, `— <a href="%s">👍 Give Kudos</a></li>`, template.HTMLEscapeString(kURL))
+				if act.LocationStr != "" {
+					fmt.Fprintf(&desc, `<br/>📍 %s`, template.HTMLEscapeString(act.LocationStr))
+				}
+				fmt.Fprintf(&desc, `</p>`)
+				if act.EncodedPolyline != "" {
+					mURL := a.mapURL(act.ID)
+					fmt.Fprintf(&desc, `<p><img src="%s" alt="GPS route map" style="max-width:100%%;border-radius:8px;border:1px solid #e5e7eb;" /></p>`,
+						template.HTMLEscapeString(mURL))
+				}
+				for idx := range act.ImageURLs {
+					pURL := a.photoURL(act.ID, idx)
+					fmt.Fprintf(&desc, `<p><img src="%s" alt="Workout photo" style="max-width:100%%;border-radius:8px;" /></p>`,
+						template.HTMLEscapeString(pURL))
+				}
+				fmt.Fprintf(&desc, `<p><a href="%s"><strong>👍 Give Kudos</strong></a></p></div>`,
+					template.HTMLEscapeString(kURL))
 			}
-			desc.WriteString("</ul>")
 			items = append(items, rssItem{
 				Title:       fmt.Sprintf("%s's Weekly Workout Digest (%s — %d activities)", a.cfg.AthleteName, g.Key, len(g.Acts)),
 				Link:        a.prefURL(sub.ID),
@@ -1120,21 +1642,29 @@ func (a *App) listSubscribersByPref(pref string) ([]Subscriber, error) {
 
 func (a *App) getActivity(id string) (StoredActivity, error) {
 	var act StoredActivity
+	var imgsJSON string
 	var digestInt int
 	err := a.db.QueryRow(`
 		SELECT id, name, sport_type, start_date_local, location_str,
-		       distance_m, moving_time_s, elevation_m, image_url, digest_sent, created_at
+		       distance_m, moving_time_s, elevation_m, image_url, image_urls_json,
+		       encoded_polyline, digest_sent, created_at
 		FROM activities WHERE id = ?
 	`, id).Scan(&act.ID, &act.Name, &act.SportType, &act.StartDateLocal, &act.LocationStr,
-		&act.DistanceM, &act.MovingTimeS, &act.ElevationM, &act.ImageURL, &digestInt, &act.CreatedAt)
+		&act.DistanceM, &act.MovingTimeS, &act.ElevationM, &act.ImageURL, &imgsJSON,
+		&act.EncodedPolyline, &digestInt, &act.CreatedAt)
+	if err != nil {
+		return act, err
+	}
 	act.DigestSent = digestInt == 1
-	return act, err
+	act.ImageURLs = parseImageURLs(imgsJSON, act.ImageURL)
+	return act, nil
 }
 
 func (a *App) getPendingDigestActivities() ([]StoredActivity, error) {
 	rows, err := a.db.Query(`
 		SELECT id, name, sport_type, start_date_local, location_str,
-		       distance_m, moving_time_s, elevation_m, image_url, digest_sent, created_at
+		       distance_m, moving_time_s, elevation_m, image_url, image_urls_json,
+		       encoded_polyline, digest_sent, created_at
 		FROM activities WHERE digest_sent = 0
 		ORDER BY start_date_local DESC
 	`)
@@ -1148,7 +1678,8 @@ func (a *App) getPendingDigestActivities() ([]StoredActivity, error) {
 func (a *App) listRecentActivities(limit int) ([]StoredActivity, error) {
 	rows, err := a.db.Query(`
 		SELECT id, name, sport_type, start_date_local, location_str,
-		       distance_m, moving_time_s, elevation_m, image_url, digest_sent, created_at
+		       distance_m, moving_time_s, elevation_m, image_url, image_urls_json,
+		       encoded_polyline, digest_sent, created_at
 		FROM activities
 		ORDER BY start_date_local DESC
 		LIMIT ?
@@ -1164,14 +1695,28 @@ func scanActivities(rows *sql.Rows) ([]StoredActivity, error) {
 	var out []StoredActivity
 	for rows.Next() {
 		var act StoredActivity
+		var imgsJSON string
 		var digestInt int
 		if err := rows.Scan(&act.ID, &act.Name, &act.SportType, &act.StartDateLocal, &act.LocationStr,
-			&act.DistanceM, &act.MovingTimeS, &act.ElevationM, &act.ImageURL, &digestInt, &act.CreatedAt); err == nil {
+			&act.DistanceM, &act.MovingTimeS, &act.ElevationM, &act.ImageURL, &imgsJSON,
+			&act.EncodedPolyline, &digestInt, &act.CreatedAt); err == nil {
 			act.DigestSent = digestInt == 1
+			act.ImageURLs = parseImageURLs(imgsJSON, act.ImageURL)
 			out = append(out, act)
 		}
 	}
 	return out, nil
+}
+
+func parseImageURLs(imgsJSON, legacyURL string) []string {
+	var urls []string
+	if imgsJSON != "" {
+		_ = json.Unmarshal([]byte(imgsJSON), &urls)
+	}
+	if len(urls) == 0 && legacyURL != "" {
+		urls = []string{legacyURL}
+	}
+	return urls
 }
 
 func (a *App) listKudosNames(activityID string) []string {
@@ -1224,8 +1769,6 @@ func parseActivityTime(startLocal string, fallback time.Time) time.Time {
 	return fallback
 }
 
-// digestPublishTime returns the configured DIGEST_WEEKDAY at DIGEST_HOUR:00:00 (in local TZ)
-// for the ISO week (Mon–Sun) containing t.
 func (a *App) digestPublishTime(t time.Time) time.Time {
 	local := t.In(time.Local)
 	dayOffset := isoWeekday(a.cfg.DigestWeekday) - isoWeekday(local.Weekday())
@@ -1276,9 +1819,14 @@ var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
       {{if .LocationStr}}
         <p style="margin:4px 0 12px 0; font-size:14px; color:#6b7280;">📍 {{.LocationStr}}</p>
       {{end}}
-      {{if .ImageURL}}
+      {{if .MapImageURL}}
         <div style="margin:12px 0;">
-          <img src="{{.ImageURL}}" alt="Activity photo" style="max-width:100%; border-radius:8px; display:block;" />
+          <img src="{{.MapImageURL}}" alt="GPS Route Map" style="max-width:100%; border-radius:8px; border:1px solid #e5e7eb; display:block;" />
+        </div>
+      {{end}}
+      {{range .PhotoURLs}}
+        <div style="margin:12px 0;">
+          <img src="{{.}}" alt="Activity photo" style="max-width:100%; border-radius:8px; display:block;" />
         </div>
       {{end}}
       <div style="margin-top:14px;">
@@ -1359,7 +1907,7 @@ var kudosPageTmpl = template.Must(template.New("kudos").Parse(`<!DOCTYPE html>
         document.getElementById("status-title").textContent = "Could not send automatically — please refresh.";
       }
     })();
-  </script>
+    </script>
 </body>
 </html>`))
 
