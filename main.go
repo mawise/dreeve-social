@@ -875,6 +875,7 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 	var items []rssItem
 	if mode == "instant" {
 		for _, act := range acts {
+			actTime := parseActivityTime(act.StartDateLocal, act.CreatedAt)
 			kURL := a.kudosURL(act.ID, sub.ID)
 			desc := fmt.Sprintf("<p><strong>%s</strong> (%s) — %s</p>",
 				template.HTMLEscapeString(act.Name),
@@ -897,7 +898,7 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 				Title:       fmt.Sprintf("%s: %s", act.SportType, act.Name),
 				Link:        kURL,
 				GUID:        act.ID + "-" + sub.ID,
-				PubDate:     act.CreatedAt.Format(time.RFC1123Z),
+				PubDate:     actTime.Format(time.RFC1123Z),
 				Description: desc,
 			})
 		}
@@ -912,14 +913,16 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 		groupMap := map[string]*weekGroup{}
 
 		for _, act := range acts {
-			t := parseActivityTime(act.StartDateLocal, act.CreatedAt)
-			y, wNum := t.ISOWeek()
+			actTime := parseActivityTime(act.StartDateLocal, act.CreatedAt)
+			y, wNum := actTime.ISOWeek()
 			key := fmt.Sprintf("%d-W%02d", y, wNum)
 			g, exists := groupMap[key]
 			if !exists {
-				g = &weekGroup{Key: key, LatestTime: act.CreatedAt}
+				g = &weekGroup{Key: key, LatestTime: actTime}
 				groupMap[key] = g
 				groups = append(groups, g)
+			} else if actTime.After(g.LatestTime) {
+				g.LatestTime = actTime
 			}
 			g.Acts = append(g.Acts, act)
 		}
@@ -1209,8 +1212,13 @@ func formatStatsLine(act StoredActivity) string {
 }
 
 func parseActivityTime(startLocal string, fallback time.Time) time.Time {
-	for _, layout := range []string{"2006-01-02T15:04:05", time.RFC3339, "2006-01-02"} {
-		if t, err := time.Parse(layout, startLocal); err == nil {
+	// 1. Try formats that include an explicit timezone offset first
+	if t, err := time.Parse(time.RFC3339, startLocal); err == nil {
+		return t
+	}
+	// 2. Parse local Dreeve timestamps using the container's local timezone (TZ)
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, startLocal, time.Local); err == nil {
 			return t
 		}
 	}
