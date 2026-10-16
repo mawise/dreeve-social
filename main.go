@@ -903,11 +903,11 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	} else {
-		// Group activities by ISO week for the weekly digest RSS feed
+		// Group activities by ISO week and use the configured digest publish time as PubDate
 		type weekGroup struct {
-			Key        string
-			LatestTime time.Time
-			Acts       []StoredActivity
+			Key         string
+			PublishTime time.Time
+			Acts        []StoredActivity
 		}
 		var groups []*weekGroup
 		groupMap := map[string]*weekGroup{}
@@ -918,11 +918,12 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 			key := fmt.Sprintf("%d-W%02d", y, wNum)
 			g, exists := groupMap[key]
 			if !exists {
-				g = &weekGroup{Key: key, LatestTime: actTime}
+				g = &weekGroup{
+					Key:         key,
+					PublishTime: a.digestPublishTime(actTime),
+				}
 				groupMap[key] = g
 				groups = append(groups, g)
-			} else if actTime.After(g.LatestTime) {
-				g.LatestTime = actTime
 			}
 			g.Acts = append(g.Acts, act)
 		}
@@ -948,7 +949,7 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 				Title:       fmt.Sprintf("%s's Weekly Workout Digest (%s — %d activities)", a.cfg.AthleteName, g.Key, len(g.Acts)),
 				Link:        a.prefURL(sub.ID),
 				GUID:        "digest-" + g.Key + "-" + sub.ID,
-				PubDate:     g.LatestTime.Format(time.RFC1123Z),
+				PubDate:     g.PublishTime.Format(time.RFC1123Z),
 				Description: desc.String(),
 			})
 		}
@@ -1212,17 +1213,34 @@ func formatStatsLine(act StoredActivity) string {
 }
 
 func parseActivityTime(startLocal string, fallback time.Time) time.Time {
-	// 1. Try formats that include an explicit timezone offset first
 	if t, err := time.Parse(time.RFC3339, startLocal); err == nil {
 		return t
 	}
-	// 2. Parse local Dreeve timestamps using the container's local timezone (TZ)
 	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
 		if t, err := time.ParseInLocation(layout, startLocal, time.Local); err == nil {
 			return t
 		}
 	}
 	return fallback
+}
+
+// digestPublishTime returns the configured DIGEST_WEEKDAY at DIGEST_HOUR:00:00 (in local TZ)
+// for the ISO week (Mon–Sun) containing t.
+func (a *App) digestPublishTime(t time.Time) time.Time {
+	local := t.In(time.Local)
+	dayOffset := isoWeekday(a.cfg.DigestWeekday) - isoWeekday(local.Weekday())
+	targetDate := local.AddDate(0, 0, dayOffset)
+	return time.Date(
+		targetDate.Year(), targetDate.Month(), targetDate.Day(),
+		a.cfg.DigestHour, 0, 0, 0, time.Local,
+	)
+}
+
+func isoWeekday(w time.Weekday) int {
+	if w == time.Sunday {
+		return 7
+	}
+	return int(w)
 }
 
 func formatPrettyDate(startLocal string) string {
