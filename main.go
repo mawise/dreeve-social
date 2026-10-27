@@ -39,25 +39,26 @@ const (
 
 // Config holds all environment-driven settings.
 type Config struct {
-	DBPath          string
-	ListenAddr      string
-	AthleteName     string
-	DreeveURL       string
-	DreeveToken     string
-	PublicBaseURL   string
-	HMACSecret      string
-	PollInterval    time.Duration
-	DigestWeekday   time.Weekday
-	DigestHour      int
-	MailgunDomain   string
-	MailgunAPIKey   string
-	MailgunFrom     string
-	MailgunAPIBase  string
-	NtfyTopicURL    string
-	NtfyToken       string
-	InitialFriends  string
-	SeedExisting    bool
-	OSMTileTemplate string
+	DBPath            string
+	ListenAddr        string
+	AthleteName       string
+	DreeveURL         string
+	DreeveToken       string
+	PublicBaseURL     string
+	HMACSecret        string
+	PollInterval      time.Duration
+	DigestWeekday     time.Weekday
+	DigestHour        int
+	MailgunDomain     string
+	MailgunAPIKey     string
+	MailgunFrom       string
+	MailgunAPIBase    string
+	NtfyTopicURL      string
+	NtfyToken         string
+	NotificationEmail string
+	InitialFriends    string
+	SeedExisting      bool
+	OSMTileTemplate   string
 }
 
 type App struct {
@@ -132,25 +133,26 @@ func loadConfig() Config {
 	}
 
 	return Config{
-		DBPath:          getEnv("DB_PATH", "/data/sidecar.db"),
-		ListenAddr:      getEnv("LISTEN_ADDR", ":8080"),
-		AthleteName:     getEnv("ATHLETE_NAME", "Alex"),
-		DreeveURL:       strings.TrimRight(getEnv("DREEVE_URL", "http://dreeve:8080"), "/"),
-		DreeveToken:     getEnv("DREEVE_API_TOKEN", ""),
-		PublicBaseURL:   strings.TrimRight(getEnv("PUBLIC_BASE_URL", "http://localhost:8090"), "/"),
-		HMACSecret:      getEnv("HMAC_SECRET", "change-me-in-production"),
-		PollInterval:    time.Duration(pollMin) * time.Minute,
-		DigestWeekday:   time.Weekday(digestDayInt),
-		DigestHour:      digestHour,
-		MailgunDomain:   getEnv("MAILGUN_DOMAIN", ""),
-		MailgunAPIKey:   getEnv("MAILGUN_API_KEY", ""),
-		MailgunFrom:     getEnv("MAILGUN_FROM", "Dreeve Social <noreply@example.com>"),
-		MailgunAPIBase:  strings.TrimRight(getEnv("MAILGUN_API_BASE", "https://api.mailgun.net"), "/"),
-		NtfyTopicURL:    getEnv("NTFY_TOPIC_URL", ""),
-		NtfyToken:       getEnv("NTFY_TOKEN", ""),
-		InitialFriends:  getEnv("FRIENDS", ""),
-		SeedExisting:    strings.EqualFold(getEnv("SEED_EXISTING_WITHOUT_EMAIL", "true"), "true"),
-		OSMTileTemplate: getEnv("OSM_TILE_URL", "https://tile.openstreetmap.org/%d/%d/%d.png"),
+		DBPath:            getEnv("DB_PATH", "/data/sidecar.db"),
+		ListenAddr:        getEnv("LISTEN_ADDR", ":8080"),
+		AthleteName:       getEnv("ATHLETE_NAME", "Alex"),
+		DreeveURL:         strings.TrimRight(getEnv("DREEVE_URL", "http://dreeve:8080"), "/"),
+		DreeveToken:       getEnv("DREEVE_API_TOKEN", ""),
+		PublicBaseURL:     strings.TrimRight(getEnv("PUBLIC_BASE_URL", "http://localhost:8090"), "/"),
+		HMACSecret:        getEnv("HMAC_SECRET", "change-me-in-production"),
+		PollInterval:      time.Duration(pollMin) * time.Minute,
+		DigestWeekday:     time.Weekday(digestDayInt),
+		DigestHour:        digestHour,
+		MailgunDomain:     getEnv("MAILGUN_DOMAIN", ""),
+		MailgunAPIKey:     getEnv("MAILGUN_API_KEY", ""),
+		MailgunFrom:       getEnv("MAILGUN_FROM", "Dreeve Social <noreply@example.com>"),
+		MailgunAPIBase:    strings.TrimRight(getEnv("MAILGUN_API_BASE", "https://api.mailgun.net"), "/"),
+		NtfyTopicURL:      getEnv("NTFY_TOPIC_URL", ""),
+		NtfyToken:         getEnv("NTFY_TOKEN", ""),
+		NotificationEmail: getEnv("NOTIFICATION_EMAIL", getEnv("ATHLETE_EMAIL", "")),
+		InitialFriends:    getEnv("FRIENDS", ""),
+		SeedExisting:      strings.EqualFold(getEnv("SEED_EXISTING_WITHOUT_EMAIL", "true"), "true"),
+		OSMTileTemplate:   getEnv("OSM_TILE_URL", "https://tile.openstreetmap.org/%d/%d/%d.png"),
 	}
 }
 
@@ -190,6 +192,7 @@ func main() {
 	mux.HandleFunc("GET /feed.xml", app.handleRSSFeed)
 	mux.HandleFunc("GET /map.png", app.handleMapPNG)
 	mux.HandleFunc("GET /photo", app.handleActivityPhoto)
+	mux.HandleFunc("GET /activity", app.handleActivityGet)
 	mux.HandleFunc("GET /kudos", app.handleKudosGet)
 	mux.HandleFunc("POST /api/kudos", app.handleKudosPost)
 	mux.HandleFunc("GET /preferences", app.handlePreferencesGet)
@@ -330,6 +333,15 @@ func (a *App) sign(purpose, payload string) string {
 func (a *App) verify(purpose, payload, sig string) bool {
 	expected := a.sign(purpose, payload)
 	return hmac.Equal([]byte(expected), []byte(sig))
+}
+
+func (a *App) activityURL(activityID, subscriberID string) string {
+	sig := a.sign("activity", activityID+":"+subscriberID)
+	q := url.Values{}
+	q.Set("act", activityID)
+	q.Set("who", subscriberID)
+	q.Set("sig", sig)
+	return a.cfg.PublicBaseURL + "/activity?" + q.Encode()
 }
 
 func (a *App) kudosURL(activityID, subscriberID string) string {
@@ -1175,6 +1187,7 @@ type emailActivityCard struct {
 	StatsLine     string
 	MapImageURL   string
 	PhotoURLs     []string
+	ActivityURL   string
 	KudosURL      string
 }
 
@@ -1189,6 +1202,7 @@ func (a *App) renderActivityEmail(sub Subscriber, acts []StoredActivity, isWeekl
 	}
 
 	for _, act := range acts {
+		actURL := a.activityURL(act.ID, sub.ID)
 		kURL := a.kudosURL(act.ID, sub.ID)
 		stats := formatStatsLine(act)
 		fDate := formatPrettyDate(act.StartDateLocal)
@@ -1208,6 +1222,7 @@ func (a *App) renderActivityEmail(sub Subscriber, acts []StoredActivity, isWeekl
 			StatsLine:      stats,
 			MapImageURL:    mapImg,
 			PhotoURLs:      photos,
+			ActivityURL:    actURL,
 			KudosURL:       kURL,
 		})
 
@@ -1221,6 +1236,7 @@ func (a *App) renderActivityEmail(sub Subscriber, acts []StoredActivity, isWeekl
 		if mapImg != "" {
 			fmt.Fprintf(&textBuilder, "  Route Map: %s\n", mapImg)
 		}
+		fmt.Fprintf(&textBuilder, "  View Activity: %s\n", actURL)
 		fmt.Fprintf(&textBuilder, "  Give Kudos (1-click): %s\n\n", kURL)
 	}
 
@@ -1375,10 +1391,12 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 	if mode == "instant" {
 		for _, act := range acts {
 			actTime := parseActivityTime(act.StartDateLocal, act.CreatedAt)
+			actURL := a.activityURL(act.ID, sub.ID)
 			kURL := a.kudosURL(act.ID, sub.ID)
 			var desc strings.Builder
 
-			fmt.Fprintf(&desc, "<p><strong>%s</strong> (%s) — %s</p>",
+			fmt.Fprintf(&desc, `<p><strong><a href="%s">%s</a></strong> (%s) — %s</p>`,
+				template.HTMLEscapeString(actURL),
 				template.HTMLEscapeString(act.Name),
 				template.HTMLEscapeString(act.SportType),
 				template.HTMLEscapeString(formatPrettyDate(act.StartDateLocal)))
@@ -1398,12 +1416,14 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 				fmt.Fprintf(&desc, `<p><img src="%s" alt="Workout photo" style="max-width:100%%;border-radius:8px;" /></p>`,
 					template.HTMLEscapeString(pURL))
 			}
-			fmt.Fprintf(&desc, `<p><a href="%s"><strong>👍 Give Kudos to %s (1-Click)</strong></a></p>`,
-				template.HTMLEscapeString(kURL), template.HTMLEscapeString(a.cfg.AthleteName))
+			fmt.Fprintf(&desc, `<p><a href="%s"><strong>🔗 View Activity</strong></a> &nbsp;•&nbsp; <a href="%s"><strong>👍 Give Kudos to %s (1-Click)</strong></a></p>`,
+				template.HTMLEscapeString(actURL),
+				template.HTMLEscapeString(kURL),
+				template.HTMLEscapeString(a.cfg.AthleteName))
 
 			items = append(items, rssItem{
 				Title:       fmt.Sprintf("%s: %s", act.SportType, act.Name),
-				Link:        kURL,
+				Link:        actURL,
 				GUID:        act.ID + "-" + sub.ID,
 				PubDate:     actTime.Format(time.RFC1123Z),
 				Description: desc.String(),
@@ -1440,10 +1460,12 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&desc, "<p><strong>%s's workouts for week %s (%d activities):</strong></p>",
 				template.HTMLEscapeString(a.cfg.AthleteName), g.Key, len(g.Acts))
 			for _, act := range g.Acts {
+				actURL := a.activityURL(act.ID, sub.ID)
 				kURL := a.kudosURL(act.ID, sub.ID)
 				stats := formatStatsLine(act)
 				fmt.Fprintf(&desc, `<div style="margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid #e5e7eb;">`)
-				fmt.Fprintf(&desc, `<p><strong>%s</strong> (%s) — %s`,
+				fmt.Fprintf(&desc, `<p><strong><a href="%s">%s</a></strong> (%s) — %s`,
+					template.HTMLEscapeString(actURL),
 					template.HTMLEscapeString(act.Name),
 					template.HTMLEscapeString(act.SportType),
 					template.HTMLEscapeString(formatPrettyDate(act.StartDateLocal)))
@@ -1464,7 +1486,8 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(&desc, `<p><img src="%s" alt="Workout photo" style="max-width:100%%;border-radius:8px;" /></p>`,
 						template.HTMLEscapeString(pURL))
 				}
-				fmt.Fprintf(&desc, `<p><a href="%s"><strong>👍 Give Kudos</strong></a></p></div>`,
+				fmt.Fprintf(&desc, `<p><a href="%s"><strong>🔗 View Activity</strong></a> &nbsp;•&nbsp; <a href="%s"><strong>👍 Give Kudos</strong></a></p></div>`,
+					template.HTMLEscapeString(actURL),
 					template.HTMLEscapeString(kURL))
 			}
 			items = append(items, rssItem{
@@ -1500,8 +1523,75 @@ func (a *App) handleRSSFeed(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================================
-// HTTP Handlers: Bot-Safe 1-Click Kudos + ntfy Push Alert
+// HTTP Handlers: Non-Kudos Activity View, Bot-Safe 1-Click Kudos & Alerts
 // ============================================================================
+
+func (a *App) handleActivityGet(w http.ResponseWriter, r *http.Request) {
+	actID := r.URL.Query().Get("act")
+	who := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("who")))
+	sig := r.URL.Query().Get("sig")
+
+	if actID == "" || who == "" || !a.verify("activity", actID+":"+who, sig) {
+		http.Error(w, "Invalid activity link signature", http.StatusForbidden)
+		return
+	}
+
+	act, err := a.getActivity(actID)
+	if err != nil {
+		http.Error(w, "Activity not found", http.StatusNotFound)
+		return
+	}
+	sub, err := a.getSubscriber(who)
+	if err != nil {
+		http.Error(w, "Subscriber not found", http.StatusNotFound)
+		return
+	}
+
+	mapImg := ""
+	if act.EncodedPolyline != "" {
+		mapImg = a.mapURL(act.ID)
+	}
+	var photos []string
+	for idx := range act.ImageURLs {
+		photos = append(photos, a.photoURL(act.ID, idx))
+	}
+
+	kudosNames := a.listKudosNames(act.ID)
+	alreadyCheered := a.hasSubscriberGivenKudos(act.ID, sub.ID)
+
+	data := struct {
+		Activity       StoredActivity
+		Subscriber     Subscriber
+		AthleteName    string
+		FormattedDate  string
+		StatsLine      string
+		MapImageURL    string
+		PhotoURLs      []string
+		KudosNames     []string
+		KudosRosterStr string
+		AlreadyCheered bool
+		KudosSig       string
+		KudosURL       string
+		PrefURL        string
+	}{
+		Activity:       act,
+		Subscriber:     sub,
+		AthleteName:    a.cfg.AthleteName,
+		FormattedDate:  formatPrettyDate(act.StartDateLocal),
+		StatsLine:      formatStatsLine(act),
+		MapImageURL:    mapImg,
+		PhotoURLs:      photos,
+		KudosNames:     kudosNames,
+		KudosRosterStr: strings.Join(kudosNames, ", "),
+		AlreadyCheered: alreadyCheered,
+		KudosSig:       a.sign("kudos", act.ID+":"+sub.ID),
+		KudosURL:       a.kudosURL(act.ID, sub.ID),
+		PrefURL:        a.prefURL(sub.ID),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = activityPageTmpl.Execute(w, data)
+}
 
 func (a *App) handleKudosGet(w http.ResponseWriter, r *http.Request) {
 	actID := r.URL.Query().Get("act")
@@ -1529,12 +1619,14 @@ func (a *App) handleKudosGet(w http.ResponseWriter, r *http.Request) {
 		Subscriber  Subscriber
 		AthleteName string
 		Sig         string
+		ActivityURL string
 		PrefURL     string
 	}{
 		Activity:    act,
 		Subscriber:  sub,
 		AthleteName: a.cfg.AthleteName,
 		Sig:         sig,
+		ActivityURL: a.activityURL(act.ID, sub.ID),
 		PrefURL:     a.prefURL(sub.ID),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1579,7 +1671,7 @@ func (a *App) handleKudosPost(w http.ResponseWriter, r *http.Request) {
 	names := a.listKudosNames(act.ID)
 
 	if rowsAffected > 0 {
-		go a.sendNtfyNotification(act, sub, len(names))
+		go a.sendKudosNotifications(act, sub, names)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1591,11 +1683,21 @@ func (a *App) handleKudosPost(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) sendNtfyNotification(act StoredActivity, sub Subscriber, total int) {
-	if a.cfg.NtfyTopicURL == "" {
+func (a *App) sendKudosNotifications(act StoredActivity, sub Subscriber, names []string) {
+	total := len(names)
+	if a.cfg.NtfyTopicURL == "" && a.cfg.NotificationEmail == "" {
 		log.Printf("[KUDOS] %s gave kudos on %q (total: %d)", sub.Name, act.Name, total)
 		return
 	}
+	if a.cfg.NtfyTopicURL != "" {
+		a.sendNtfyNotification(act, sub, total)
+	}
+	if a.cfg.NotificationEmail != "" {
+		a.sendKudosEmailNotification(act, sub, names)
+	}
+}
+
+func (a *App) sendNtfyNotification(act StoredActivity, sub Subscriber, total int) {
 	msg := fmt.Sprintf("👍 %s gave you kudos on %q (%s)! Total kudos: %d",
 		sub.Name, act.Name, act.SportType, total)
 	req, err := http.NewRequest("POST", a.cfg.NtfyTopicURL, strings.NewReader(msg))
@@ -1610,6 +1712,44 @@ func (a *App) sendNtfyNotification(act StoredActivity, sub Subscriber, total int
 	resp, err := a.httpClient.Do(req)
 	if err == nil && resp != nil {
 		resp.Body.Close()
+	}
+}
+
+func (a *App) sendKudosEmailNotification(act StoredActivity, sub Subscriber, names []string) {
+	total := len(names)
+	roster := strings.Join(names, ", ")
+	subject := fmt.Sprintf("👍 %s gave you kudos on %s!", sub.Name, act.Name)
+
+	textBody := fmt.Sprintf(
+		"Hi %s,\n\n%s (%s) just gave you kudos on %q (%s)!\n\nTotal kudos (%d): %s\n",
+		a.cfg.AthleteName, sub.Name, sub.Email, act.Name, act.SportType, total, roster,
+	)
+
+	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f4f5f7; margin:0; padding:24px; color:#1f2937;">
+  <div style="max-width:480px; margin:0 auto; background:#ffffff; border-radius:12px; padding:24px; box-shadow:0 2px 6px rgba(0,0,0,0.06);">
+    <h2 style="margin-top:0; color:#111827;">👍 New Workout Kudos!</h2>
+    <p style="font-size:15px; color:#374151;">
+      <strong>%s</strong> just gave you kudos on <strong>%s</strong> (%s).
+    </p>
+    <div style="font-size:14px; color:#374151; background:#f9fafb; padding:12px; border-radius:8px; border:1px solid #e5e7eb;">
+      <strong>Cheered by (%d):</strong> %s
+    </div>
+  </div>
+</body>
+</html>`,
+		template.HTMLEscapeString(sub.Name),
+		template.HTMLEscapeString(act.Name),
+		template.HTMLEscapeString(act.SportType),
+		total,
+		template.HTMLEscapeString(roster),
+	)
+
+	if err := a.sendMailgun(a.cfg.NotificationEmail, subject, textBody, htmlBody); err != nil {
+		log.Printf("mailgun error sending kudos notification email to %s: %v", a.cfg.NotificationEmail, err)
+	} else {
+		log.Printf("sent kudos notification email for %s to %s", act.ID, a.cfg.NotificationEmail)
 	}
 }
 
@@ -1735,6 +1875,12 @@ func (a *App) listKudosNames(activityID string) []string {
 	return names
 }
 
+func (a *App) hasSubscriberGivenKudos(activityID, subscriberID string) bool {
+	var existing string
+	err := a.db.QueryRow(`SELECT subscriber_id FROM kudos WHERE activity_id = ? AND subscriber_id = ?`, activityID, subscriberID).Scan(&existing)
+	return err == nil
+}
+
 func formatStatsLine(act StoredActivity) string {
 	var parts []string
 	if act.DistanceM > 0 {
@@ -1795,7 +1941,7 @@ func formatPrettyDate(startLocal string) string {
 }
 
 // ============================================================================
-// Embedded HTML Templates (Email, Kudos Page, Preferences & RSS Page)
+// Embedded HTML Templates (Email, Activity Page, Kudos Page, Preferences)
 // ============================================================================
 
 var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
@@ -1812,7 +1958,9 @@ var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
       <div style="font-size:12px; font-weight:700; text-transform:uppercase; color:#ea580c; letter-spacing:0.05em;">
         {{.SportType}} • {{.FormattedDate}}
       </div>
-      <h3 style="margin:6px 0 8px 0; font-size:20px; color:#111827;">{{.Name}}</h3>
+      <h3 style="margin:6px 0 8px 0; font-size:20px; color:#111827;">
+        <a href="{{.ActivityURL}}" style="color:#111827; text-decoration:none;">{{.Name}}</a>
+      </h3>
       {{if .StatsLine}}
         <p style="margin:4px 0; font-size:15px; font-weight:600; color:#374151;">📊 {{.StatsLine}}</p>
       {{end}}
@@ -1821,7 +1969,9 @@ var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
       {{end}}
       {{if .MapImageURL}}
         <div style="margin:12px 0;">
-          <img src="{{.MapImageURL}}" alt="GPS Route Map" style="max-width:100%; border-radius:8px; border:1px solid #e5e7eb; display:block;" />
+          <a href="{{.ActivityURL}}">
+            <img src="{{.MapImageURL}}" alt="GPS Route Map" style="max-width:100%; border-radius:8px; border:1px solid #e5e7eb; display:block;" />
+          </a>
         </div>
       {{end}}
       {{range .PhotoURLs}}
@@ -1830,6 +1980,9 @@ var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
         </div>
       {{end}}
       <div style="margin-top:14px;">
+        <a href="{{.ActivityURL}}" style="display:inline-block; background:#ffffff; color:#374151; border:1px solid #d1d5db; text-decoration:none; font-weight:600; font-size:14px; padding:9px 16px; border-radius:8px; margin-right:8px;">
+          🔗 View Activity
+        </a>
         <a href="{{.KudosURL}}" style="display:inline-block; background:#ea580c; color:#ffffff; text-decoration:none; font-weight:600; font-size:14px; padding:10px 18px; border-radius:8px;">
           👍 Give Kudos to {{$.AthleteName}}
         </a>
@@ -1855,6 +2008,92 @@ var emailTmpl = template.Must(template.New("email").Parse(`<!DOCTYPE html>
 </body>
 </html>`))
 
+var activityPageTmpl = template.Must(template.New("activity").Parse(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{.Activity.Name}} — {{.AthleteName}}</title>
+</head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#f4f5f7; margin:0; padding:24px; color:#1f2937;">
+  <div style="max-width:580px; margin:24px auto; background:#fff; border-radius:12px; padding:28px; box-shadow:0 4px 12px rgba(0,0,0,0.08);">
+    <div style="font-size:12px; font-weight:700; text-transform:uppercase; color:#ea580c; letter-spacing:0.05em;">
+      {{.AthleteName}} • {{.Activity.SportType}} • {{.FormattedDate}}
+    </div>
+    <h2 style="margin:6px 0 10px 0; font-size:24px; color:#111827;">{{.Activity.Name}}</h2>
+
+    {{if .StatsLine}}
+      <p style="margin:4px 0; font-size:16px; font-weight:600; color:#374151;">📊 {{.StatsLine}}</p>
+    {{end}}
+    {{if .Activity.LocationStr}}
+      <p style="margin:4px 0 14px 0; font-size:14px; color:#6b7280;">📍 {{.Activity.LocationStr}}</p>
+    {{end}}
+
+    {{if .MapImageURL}}
+      <div style="margin:16px 0;">
+        <img src="{{.MapImageURL}}" alt="GPS Route Map" style="max-width:100%; border-radius:8px; border:1px solid #e5e7eb; display:block;" />
+      </div>
+    {{end}}
+
+    {{range .PhotoURLs}}
+      <div style="margin:16px 0;">
+        <img src="{{.}}" alt="Activity photo" style="max-width:100%; border-radius:8px; display:block;" />
+      </div>
+    {{end}}
+
+    <div style="margin-top:20px; padding-top:16px; border-top:1px solid #e5e7eb;">
+      <a id="kudos-btn" href="{{.KudosURL}}" style="display:inline-block; background:{{if .AlreadyCheered}}#10b981{{else}}#ea580c{{end}}; color:#ffffff; text-decoration:none; font-weight:600; font-size:15px; padding:12px 22px; border-radius:8px; cursor:pointer;">
+        {{if .AlreadyCheered}}🎉 You've cheered this workout!{{else}}👍 Give Kudos to {{.AthleteName}}{{end}}
+      </a>
+
+      <div id="kudos-roster" style="margin-top:14px; font-size:14px; color:#374151; background:#f9fafb; padding:12px; border-radius:8px; {{if not .KudosNames}}display:none;{{end}}">
+        {{if .KudosNames}}Cheered by ({{len .KudosNames}}): {{.KudosRosterStr}}{{end}}
+      </div>
+    </div>
+
+    <hr style="border:none; border-top:1px solid #e5e7eb; margin:24px 0 12px 0;" />
+    <p style="font-size:12px; color:#6b7280; margin:0;">
+      <a href="{{.PrefURL}}" style="color:#ea580c;">Manage your email &amp; RSS preferences</a>
+    </p>
+  </div>
+
+  <script>
+    (function() {
+      const btn = document.getElementById("kudos-btn");
+      const roster = document.getElementById("kudos-roster");
+      let sending = false;
+
+      btn.addEventListener("click", async function(e) {
+        e.preventDefault();
+        if (sending) return;
+        sending = true;
+        btn.textContent = "⏳ Sending kudos...";
+
+        const body = new URLSearchParams({
+          act: "{{.Activity.ID}}",
+          who: "{{.Subscriber.ID}}",
+          sig: "{{.KudosSig}}"
+        });
+
+        try {
+          const res = await fetch("/api/kudos", { method: "POST", body });
+          const data = await res.json();
+          btn.style.background = "#10b981";
+          btn.textContent = data.alreadySent
+            ? "🎉 You've already cheered this workout!"
+            : "🎉 Kudos sent to {{.AthleteName}}!";
+          roster.style.display = "block";
+          roster.textContent = "Cheered by (" + data.totalKudos + "): " + (data.cheeredBy || []).join(", ");
+        } catch (err) {
+          sending = false;
+          btn.textContent = "⚠️ Error sending kudos — click to retry";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>`))
+
 var kudosPageTmpl = template.Must(template.New("kudos").Parse(`<!DOCTYPE html>
 <html>
 <head>
@@ -1868,6 +2107,12 @@ var kudosPageTmpl = template.Must(template.New("kudos").Parse(`<!DOCTYPE html>
     <h2 id="status-title" style="margin:0 0 8px 0;">Sending your kudos to {{.AthleteName}}...</h2>
     <p style="color:#6b7280; margin:0 0 20px 0;">Workout: <strong>{{.Activity.Name}}</strong> ({{.Activity.SportType}})</p>
     <div id="kudos-roster" style="font-size:14px; color:#374151; background:#f9fafb; padding:12px; border-radius:8px; display:none;"></div>
+
+    <div style="margin-top:18px;">
+      <a href="{{.ActivityURL}}" style="color:#ea580c; font-size:14px; font-weight:600; text-decoration:none;">
+        🔗 View full activity details
+      </a>
+    </div>
 
     <noscript>
       <form method="POST" action="/api/kudos" style="margin-top:16px;">
