@@ -1718,11 +1718,12 @@ func (a *App) sendNtfyNotification(act StoredActivity, sub Subscriber, total int
 func (a *App) sendKudosEmailNotification(act StoredActivity, sub Subscriber, names []string) {
 	total := len(names)
 	roster := strings.Join(names, ", ")
+	actURL := a.activityURL(act.ID, sub.ID)
 	subject := fmt.Sprintf("👍 %s gave you kudos on %s!", sub.Name, act.Name)
 
 	textBody := fmt.Sprintf(
-		"Hi %s,\n\n%s (%s) just gave you kudos on %q (%s)!\n\nTotal kudos (%d): %s\n",
-		a.cfg.AthleteName, sub.Name, sub.Email, act.Name, act.SportType, total, roster,
+		"Hi %s,\n\n%s (%s) just gave you kudos on %q (%s)!\nView activity: %s\n\nTotal kudos (%d): %s\n",
+		a.cfg.AthleteName, sub.Name, sub.Email, act.Name, act.SportType, actURL, total, roster,
 	)
 
 	htmlBody := fmt.Sprintf(`<!DOCTYPE html>
@@ -1731,7 +1732,7 @@ func (a *App) sendKudosEmailNotification(act StoredActivity, sub Subscriber, nam
   <div style="max-width:480px; margin:0 auto; background:#ffffff; border-radius:12px; padding:24px; box-shadow:0 2px 6px rgba(0,0,0,0.06);">
     <h2 style="margin-top:0; color:#111827;">👍 New Workout Kudos!</h2>
     <p style="font-size:15px; color:#374151;">
-      <strong>%s</strong> just gave you kudos on <strong>%s</strong> (%s).
+      <strong>%s</strong> just gave you kudos on <strong><a href="%s" style="color:#ea580c; text-decoration:underline;">%s</a></strong> (%s).
     </p>
     <div style="font-size:14px; color:#374151; background:#f9fafb; padding:12px; border-radius:8px; border:1px solid #e5e7eb;">
       <strong>Cheered by (%d):</strong> %s
@@ -1740,6 +1741,7 @@ func (a *App) sendKudosEmailNotification(act StoredActivity, sub Subscriber, nam
 </body>
 </html>`,
 		template.HTMLEscapeString(sub.Name),
+		template.HTMLEscapeString(actURL),
 		template.HTMLEscapeString(act.Name),
 		template.HTMLEscapeString(act.SportType),
 		total,
